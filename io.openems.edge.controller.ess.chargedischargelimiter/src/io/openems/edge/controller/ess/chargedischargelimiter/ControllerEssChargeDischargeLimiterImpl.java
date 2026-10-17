@@ -1,0 +1,1097 @@
+package io.openems.edge.controller.ess.chargedischargelimiter;
+
+import java.time.Duration;
+import java.time.Instant;
+import java.util.List;
+import java.util.concurrent.CopyOnWriteArrayList;
+
+import org.osgi.service.cm.ConfigurationAdmin;
+import org.osgi.service.component.ComponentContext;
+import org.osgi.service.component.annotations.Activate;
+import org.osgi.service.component.annotations.Component;
+import org.osgi.service.component.annotations.ConfigurationPolicy;
+import org.osgi.service.component.annotations.Deactivate;
+import org.osgi.service.component.annotations.Modified;
+import org.osgi.service.component.annotations.Reference;
+import org.osgi.service.component.annotations.ReferenceCardinality;
+import org.osgi.service.component.annotations.ReferencePolicy;
+import org.osgi.service.component.annotations.ReferencePolicyOption;
+import org.osgi.service.metatype.annotations.Designate;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import io.openems.edge.common.modbusslave.ModbusSlave;
+import io.openems.edge.common.modbusslave.ModbusSlaveNatureTable;
+import io.openems.edge.common.modbusslave.ModbusSlaveTable;
+import io.openems.edge.common.modbusslave.ModbusType;
+import io.openems.common.channel.AccessMode;
+import io.openems.common.exceptions.OpenemsError.OpenemsNamedException;
+import io.openems.common.types.ChannelAddress;
+import io.openems.common.types.OpenemsType;
+import io.openems.edge.common.channel.value.Value;
+import io.openems.edge.common.component.AbstractOpenemsComponent;
+import io.openems.edge.common.component.ComponentManager;
+import io.openems.edge.common.component.OpenemsComponent;
+import io.openems.edge.common.filter.RampFilter;
+import io.openems.edge.controller.api.Controller;
+import io.openems.edge.ess.api.HybridEss;
+import io.openems.edge.ess.api.ManagedSymmetricEss;
+import io.openems.edge.common.type.Phase.SingleOrAllPhase;
+import io.openems.edge.ess.power.api.Pwr;
+import io.openems.edge.common.type.TypeUtils;
+
+import io.openems.edge.timedata.api.Timedata;
+import io.openems.edge.controller.ess.chargedischargelimiter.enums.BalancingDecision;
+import io.openems.edge.controller.ess.chargedischargelimiter.enums.BalancingDeferralReason;
+import io.openems.edge.controller.ess.chargedischargelimiter.enums.State;
+import io.openems.edge.timeofusetariff.api.TimeOfUseTariff;
+
+import io.openems.edge.energy.api.EnergySchedulable;
+import io.openems.edge.energy.api.handler.EnergyScheduleHandler;
+import io.openems.edge.energy.api.handler.RescheduleMode;
+
+@Designate(ocd = Config.class, factory = true)
+@Component(//
+		name = "Controller.Ess.ChargeDischargeLimiter", //
+		immediate = true, //
+		configurationPolicy = ConfigurationPolicy.REQUIRE //
+)
+public class ControllerEssChargeDischargeLimiterImpl extends AbstractOpenemsComponent
+		implements ControllerEssChargeDischargeLimiter, Controller, OpenemsComponent, EnergySchedulable, ModbusSlave {
+
+	private final Logger log = LoggerFactory.getLogger(ControllerEssChargeDischargeLimiterImpl.class);
+
+	private Config config;
+
+	/**
+	 * Length of hysteresis in seconds. States are not changed quicker than this.
+	 * 
+	 */
+	private static final int HYSTERESIS = 10; // seconds
+	private Instant lastStateChangeTime = Instant.MIN;
+	private Instant balancingStartTime = Instant.MIN;
+	private long balancingTime = 0; // Time used for balancing so far
+	private int balancingRemainingTime = 0; // Remaining time for balancing. Used in UI
+	private Long lastEssActiveChargeEnergy = null;
+	private Integer cumulatedchargedEnergy = 0;
+	private boolean resetChargedEnergy = false;
+
+	private int minSoc = 0;
+	private int maxSoc = 0;
+	private int forceChargePower = 0;
+	private Integer currentSoc = null;
+	private int energyBetweenBalancingCycles = 0;
+	private int balancingHysteresisTime = 0;
+	private State state = State.UNDEFINED;
+	private BalancingDecision balanceDecision = BalancingDecision.UNDEFINED;
+
+	private boolean debugMode = false;
+	private Integer slowChargePower = null;
+	private Integer slowDischargePower = null;
+
+	static final int TAPER_PERCENT = 3; // decrease charge power during the last X percent before hitting the max. Soc
+	// Battery power asked for while the SoC is above the maximum, see ABOVE_MAX_SOC.
+	static final int RECOVER_DISCHARGE_W = 50;
+	static final int BALANCING_SOC = 100;
+
+	private int fullChargePower = 0;
+	private int fullDischargePower = 0;
+	private final RampFilter rampFilter = new RampFilter();
+
+	// Ramp: max. change per cycle
+	private int rampPowerW = 500;
+
+	// DC-coupled PV of a hybrid ESS. AC = battery + PV, so every limit this
+	// controller calculates for the battery has to be shifted by PV before it is
+	// applied as an AC constraint. 0 for a plain AC-coupled ESS.
+	private int pvPower = 0;
+
+	@Reference
+	private ComponentManager componentManager;
+
+	private EnergyScheduleHandler energyScheduleHandler;
+
+	@Reference
+	private ConfigurationAdmin cm;
+
+	@Reference(policy = ReferencePolicy.DYNAMIC, policyOption = ReferencePolicyOption.GREEDY, cardinality = ReferenceCardinality.OPTIONAL)
+	private volatile Timedata timedata = null;
+
+	@Reference(policy = ReferencePolicy.STATIC, policyOption = ReferencePolicyOption.GREEDY, cardinality = ReferenceCardinality.MANDATORY)
+	private ManagedSymmetricEss ess;
+
+	@Reference(policyOption = ReferencePolicyOption.GREEDY, //
+			cardinality = ReferenceCardinality.OPTIONAL, //
+			target = "(enabled=true)")
+	private TimeOfUseTariff timeOfUseTariff;
+
+	public ControllerEssChargeDischargeLimiterImpl() {
+		super(//
+				OpenemsComponent.ChannelId.values(), //
+				Controller.ChannelId.values(), //
+				ControllerEssChargeDischargeLimiter.ChannelId.values() //
+		);
+	}
+
+	@Activate
+	private void activate(ComponentContext context, Config config) {
+		super.activate(context, config.id(), config.alias(), config.enabled());
+
+		this.updateConfig(config);
+
+		this.energyScheduleHandler = io.openems.edge.controller.ess.chargedischargelimiter.EnergyScheduler
+				.buildEnergyScheduleHandler(this,
+						() -> this.config.enabled()
+								? new io.openems.edge.controller.ess.chargedischargelimiter.EnergyScheduler.Config(
+										this.config.minSoc(), this.config.maxSoc())
+								: null);
+	}
+
+	@Override
+	@Deactivate
+	protected void deactivate() {
+		super.deactivate();
+	}
+
+	@Modified
+	private void modified(ComponentContext context, Config config) {
+		super.modified(context, config.id(), config.alias(), config.enabled());
+
+		this.updateConfig(config);
+
+		if (this.energyScheduleHandler != null) {
+			this.energyScheduleHandler.triggerReschedule(
+					"ControllerEssChargeDischargeLimiterImpl::modified()",
+					RescheduleMode.DO_NOT_UPDATE_CURRENT_PERIOD);
+		}
+	}	
+	
+	
+	private void updateConfig(Config config) {
+		this.config = config;
+		if (OpenemsComponent.updateReferenceFilter(this.cm, this.servicePid(), "ess", config.ess_id())) {
+			return;
+		}
+
+		this.minSoc = this.config.minSoc();
+		this.maxSoc = this.config.maxSoc();
+		this.forceChargePower = this.config.forceChargePower();
+		this.energyBetweenBalancingCycles = this.config.energyBetweenBalancingCycles() * 1000; // kWh -> Wh
+		this.balancingHysteresisTime = this.config.balancingHysteresis();
+		this.debugMode = this.config.debugMode();
+	}
+
+	/**
+	 * The channel for cumulated chargedEnergy is not available at startup or even
+	 * 0. So we have to get the latest value from timedata.
+	 */
+	private void initializeChargedEnergyFromTimedata() {
+
+		var timedata = this.getTimedata();
+
+		if (timedata == null) {
+			this.logDebug(this.log, "Timedata service is not available.");
+			return; // Exit if timedata service is not available
+		}
+
+		this.logDebug(this.log, "Querying Timedata service for the latest energy value...");
+
+		timedata
+				.getLatestValue(new ChannelAddress(this.id(),
+						ControllerEssChargeDischargeLimiter.ChannelId.CHARGED_ENERGY.id()))
+				.thenAccept(chargedEnergy -> {
+					if (chargedEnergy.isPresent()) {
+						Integer value = TypeUtils.getAsType(OpenemsType.INTEGER, chargedEnergy.get());
+						this.logDebug(this.log, "Fetched latest ChargedEnergy value: " + value);
+						this._setChargedEnergy(value);
+					} else {
+						this.logDebug(this.log, "No current energy value found for ChargedEnergy channel");
+						this._setChargedEnergy(0);
+					}
+				});
+	}
+
+	private Timedata getTimedata() {
+		return this.timedata;
+	}
+
+	/**
+	 * PV production of a DC-coupled hybrid ESS (AC = battery + PV). 0 for a plain
+	 * AC-coupled ESS, while the channels are not available yet, and at night - in
+	 * all three cases the AC-side logic is exact.
+	 *
+	 * @return PV power in W, never negative
+	 */
+	private int calculatePvPower() {
+		if (this.ess instanceof HybridEss hss) {
+			if (this.isSetPointBatteryPower()) {
+				// The ESS takes battery power as set-point and reports battery-side
+				// Allowed*Power: no PV to add or subtract
+				return 0;
+			}
+			Integer ac = this.ess.getActivePower().get();
+			Integer dc = hss.getDcDischargePower().get();
+			if (ac != null && dc != null) {
+				return Math.max(0, ac - dc);
+			}
+		}
+		return 0;
+	}
+
+	/**
+	 * Does the ESS take battery power (instead of AC power) as set-point?
+	 *
+	 * <p>
+	 * AUTO reads the configuration property 'setPointMode' of the ESS via its
+	 * generic property channel, so there is no dependency to a specific ESS
+	 * bundle. A SolarEdge hybrid ESS in DC_SETPOINT mode is the known case.
+	 *
+	 * @return true if the set-point is battery power
+	 */
+	protected boolean isSetPointBatteryPower() {
+		return switch (this.config.setPointSemantics()) {
+		case BATTERY_ONLY -> true;
+		case AC_INCLUDING_PV -> false;
+		case AUTO -> {
+			try {
+				var value = this.ess.channel("_PropertySetPointMode").value().get();
+				yield value != null && "DC_SETPOINT".equals(value.toString());
+			} catch (RuntimeException e) {
+				yield false;
+			}
+		}
+		};
+	}
+
+	private void setEssProperties() {
+		// Initial values
+		this.slowChargePower = -500;
+		this.slowDischargePower = 500;
+		this.fullChargePower = -500;
+		this.fullDischargePower = 500;
+
+		if (this.ess == null || this.ess.getAllowedChargePower().get() == null
+				|| this.ess.getAllowedDischargePower().get() == null) {
+			this.changeState(State.UNDEFINED);
+			this.logDebug(this.log,
+					"Waiting for ESS initialization to set slow charge and discharge power. Setting minimum values");
+			return;
+		}
+
+		if (this.ess.getAllowedChargePower().get() > 0) {
+			this.logDebug(this.log, "Unable to set slow charge / discharge power");
+			return;
+		}
+
+		// Allowed*Power of a hybrid ESS is AC-side (battery limit + PV); the taper
+		// scales the battery power, so PV is taken out again.
+		this.fullChargePower = Math.min(0, this.ess.getAllowedChargePower().get() - this.pvPower);
+		this.fullDischargePower = Math.max(0, this.ess.getAllowedDischargePower().get() - this.pvPower);
+		this.slowChargePower = this.fullChargePower / 20;
+		this.slowDischargePower = this.fullDischargePower / 20;
+
+		this.logDebug(this.log, "ESS properties set: "
+				+ "AllowedChargePower " + this.fullChargePower + "W "
+				+ "AllowedDischargePower " + this.fullDischargePower + "W "
+				+ "SlowChargePower " + this.slowChargePower + "W "
+				+ "SlowDischargePower " + this.slowDischargePower + "W ");
+		return;
+
+	}
+
+	@Override
+	public void run() throws OpenemsNamedException {
+
+		this.pvPower = this.calculatePvPower();
+		this.setEssProperties();
+
+		if (this.ess == null) {
+			this.changeState(State.ERROR);
+			this.log.error("ESS is null in run method! Aborting execution.");
+			return;
+		}
+
+		this.currentSoc = this.ess.getSoc().get();
+		Integer currentActivePower = this.ess.getActivePower().get(); // AC = battery + PV
+
+		if (currentActivePower == null) {
+			this.changeState(State.ERROR);
+			this.logDebug(this.log, "ActivePower not available (yet). Aborting execution.");
+			return;
+		}
+
+		if (this.currentSoc == null) {
+			this.changeState(State.ERROR);
+			this.logDebug(this.log, "SoC not available (yet). Aborting execution.");
+			return;
+		}
+
+		// Direction and tapering refer to the battery, not to the inverter's AC
+		// side: with DC-coupled PV the AC power is positive while the battery is
+		// charging from PV.
+		final int currentBatteryPower = currentActivePower - this.pvPower;
+		Integer calculatedPower = null; // No constraints; battery power, negative = charge
+
+		this.updateUsableSocAndCapacity(this.currentSoc);
+		balanceDecision = this.shouldBalance();
+
+		float taperFactor = 0f;
+		float lin = 0f;
+
+		// Remember: Negative values for Charge; positive for Discharge
+
+		switch (this.state) {
+		case UNDEFINED:
+			if (this.ess == null) {
+				this.logDebug(this.log, "ERROR. ESS " + this.config.ess_id() + " unavailable ");
+				return;
+			}
+			// check if we can change to normal operation, i.e. if SOC and activePower
+			// values are available
+			if (this.currentSoc != null && currentActivePower != null) {
+				this.changeState(State.NORMAL);
+			}
+			break;
+		case NORMAL:
+			//
+			this._setBalancingRemainingSeconds(0); // no remaining time in normal operation
+			// check if charge energy is below the next balancing cycle. Only balance if
+			// this is desired
+			if (this.currentSoc < this.minSoc) {
+				this.changeState(State.BELOW_MIN_SOC, true);
+				calculatedPower = 0;
+				break;
+			} else if (this.currentSoc.equals(this.minSoc)) {
+				this.changeState(State.MIN_SOC_REACHED);
+				calculatedPower =0;					
+				break;
+			} else if (this.balanceDecision == BalancingDecision.YES) {
+				this.changeState(State.BALANCING_WANTED);
+				break;
+			} else if (this.currentSoc > this.maxSoc) {
+				this.changeState(State.ABOVE_MAX_SOC, true);
+				calculatedPower = 0;
+				break;
+			} else if (this.currentSoc.equals(this.maxSoc)) {
+				this.changeState(State.MAX_SOC_REACHED);
+				calculatedPower =0;	
+				break;
+			}
+			// Tapering logic: Gradual power reduction as we approach maxSoc
+			if (this.currentSoc >= (this.maxSoc - TAPER_PERCENT)) {
+				this.logDebug(this.log, "Approaching max. SoC limit : " + this.currentSoc + "%/" + this.maxSoc + "%");
+				this.changeState(State.APPROACHING_MAX_SOC);
+				break;
+			}
+
+			if (this.currentSoc <= (this.minSoc + TAPER_PERCENT)) {
+				this.logDebug(this.log, "Approaching min. SoC limit : " + this.currentSoc + "%/" + this.minSoc + "%");
+				this.changeState(State.APPROACHING_MIN_SOC);
+				break;
+			}
+
+			break;
+		case ERROR:
+			if (this.currentSoc != null && currentActivePower != null) {
+				this.changeState(State.UNDEFINED);
+			}
+			break;
+		case APPROACHING_MIN_SOC:
+			if (this.currentSoc > (this.minSoc + TAPER_PERCENT)) {
+				this.changeState(State.NORMAL);
+				break;
+			}
+			if (this.currentSoc.equals(this.minSoc)) {
+				this.changeState(State.MIN_SOC_REACHED);
+				calculatedPower = 0;				
+				break;
+			}
+			if (this.currentSoc < this.minSoc) {
+				this.changeState(State.BELOW_MIN_SOC,true);
+				calculatedPower = 0;
+				break;
+			}			
+			// The zone is left by SoC only (handled above). The battery direction
+			// must not decide it: the taper drives the battery towards 0 W, so the
+			// sign flips on noise, and every flip dropped the state to NORMAL,
+			// where no constraint applies at all. The constraint is harmless in
+			// the other direction anyway - it only limits discharge here.
+			lin = (float) (this.currentSoc - this.minSoc) / (float) TAPER_PERCENT; // 0..1
+			taperFactor = lin * lin;
+			calculatedPower = Math.round(this.fullDischargePower * taperFactor); // positiv
+			calculatedPower = Math.max(calculatedPower, this.slowDischargePower);
+			break;
+
+		case MIN_SOC_REACHED:
+			if (this.currentSoc > this.minSoc) {
+				// Straight into the taper zone: via NORMAL the state hysteresis would
+				// allow full discharge for a few seconds right above minSoc
+				this.changeState(this.currentSoc <= (this.minSoc + TAPER_PERCENT) ? State.APPROACHING_MIN_SOC
+						: State.NORMAL);
+				calculatedPower =0;
+				break;
+			} else if (this.currentSoc < this.minSoc) {
+				this.changeState(State.BELOW_MIN_SOC,true);
+				calculatedPower =0;				
+				break;
+			}
+			calculatedPower = 0;
+			break;
+		case APPROACHING_MAX_SOC:
+			// Wenn wir aus dem Fenster raus sind → zurück
+			if (this.currentSoc < (this.maxSoc - TAPER_PERCENT)) {
+				this.changeState(State.NORMAL);
+				break;
+			}
+			if (this.currentSoc.equals(this.maxSoc)) {
+				this.changeState(State.MAX_SOC_REACHED);
+				calculatedPower = 0;				
+				break;
+			}
+			if (this.currentSoc > this.maxSoc) {
+				this.changeState(State.ABOVE_MAX_SOC,true);
+				calculatedPower =0;
+				break;
+			}			
+			// Left by SoC only, see APPROACHING_MIN_SOC; the constraint limits
+			// charging only, so discharging inside the zone needs no state change.
+			lin = (float) (this.maxSoc - this.currentSoc) / (float) TAPER_PERCENT; // 1..0
+			taperFactor = lin * lin; // quadratisch
+			calculatedPower = Math.round(this.fullChargePower * taperFactor); // fullChargePower negativ
+			calculatedPower = Math.min(calculatedPower, this.slowChargePower);
+			break;
+		case MAX_SOC_REACHED:
+
+			//
+			if (this.balanceDecision == BalancingDecision.YES) {
+				this.changeState(State.BALANCING_WANTED);
+				calculatedPower = 0; // keep blocking further charge until BALANCING_WANTED takes over
+				break;
+			}
+
+			if (this.currentSoc < this.maxSoc) {
+				// Straight into the taper zone, see MIN_SOC_REACHED
+				this.changeState(this.currentSoc >= (this.maxSoc - TAPER_PERCENT) ? State.APPROACHING_MAX_SOC
+						: State.NORMAL);
+				calculatedPower = 0;
+				break;
+			} else if (this.currentSoc > this.maxSoc) {
+				this.changeState(State.ABOVE_MAX_SOC,true);
+				calculatedPower = 0;
+				break;
+			}
+			calculatedPower =0;
+
+			break;
+		case BELOW_MIN_SOC:
+			// block discharging and slowly charge
+			if (this.currentSoc < this.minSoc) {
+				calculatedPower = this.slowChargePower != null ? this.slowChargePower : 0;
+				break;
+			}
+
+			if (this.currentSoc == this.minSoc) {
+				this.changeState(State.MIN_SOC_REACHED);
+				calculatedPower = 0;
+				break;
+			}
+
+			this.changeState(this.currentSoc <= (this.minSoc + TAPER_PERCENT) ? State.APPROACHING_MIN_SOC
+					: State.NORMAL);
+			calculatedPower = 0;
+			break;
+		case ABOVE_MAX_SOC:
+
+			if (this.balanceDecision == BalancingDecision.YES) {
+				this.changeState(State.BALANCING_WANTED);
+				calculatedPower = 0; // keep blocking further charge until BALANCING_WANTED takes over
+				break;
+			}
+
+			// Above the limit the battery has to come back down, not merely stop.
+			// "Battery >= 0" is translated into an AC constraint via the PV measured
+			// one cycle earlier, so the derived battery set-point jitters around
+			// zero, and the inverter's charge bias turns that jitter into a slow
+			// charge (measured 2026-09-29: 30-50 W, the SoC drifted from 85 to
+			// 87 % within 2.5 h). A small discharge cancels both effects. At maxSoc
+			// itself MAX_SOC_REACHED takes over and only blocks charging again, so
+			// the SoC settles at the limit instead of walking away from it. At the
+			// lower limit the bias works towards the safe side, nothing to do there.
+			calculatedPower = RECOVER_DISCHARGE_W;
+
+			if (this.currentSoc == this.maxSoc) {
+				this.changeState(State.MAX_SOC_REACHED);
+				calculatedPower = 0;
+			} else if (this.currentSoc < this.maxSoc) {
+				this.changeState(this.currentSoc >= (this.maxSoc - TAPER_PERCENT) ? State.APPROACHING_MAX_SOC
+						: State.NORMAL);
+			}
+			break;
+		case FORCE_CHARGE_ACTIVE:
+			// force charge with forceChargePower
+			// Charge battery with desired power
+			// Check wether it has reached desired SOC
+			if (balanceDecision == BalancingDecision.NO) {
+				this.changeState(State.NORMAL);
+				break;
+			}
+
+			if (balanceDecision == BalancingDecision.YES_DEFERRED) {
+				this.changeState(State.BALANCING_WANTED);
+				break;
+			}
+
+			calculatedPower = this.forceChargePower * -1;
+
+			if (this.currentSoc >= BALANCING_SOC) {
+				this.changeState(State.BALANCING_ACTIVE);
+			}
+			break;
+
+		case BALANCING_ACTIVE:
+
+			// Start Timer
+			if (this.balancingStartTime.equals(Instant.MIN)) {
+				// Start the balancing timer
+				this.balancingStartTime = Instant.now(this.componentManager.getClock());
+				this.log.info("Balancing started at " + this.balancingStartTime);
+				// ToDo: channel for balancing remaining time needed for UI modal
+			}
+
+			if (balanceDecision == BalancingDecision.NO) {
+				this.resetBalancingTimers(false);
+				this.changeState(State.NORMAL);
+				break;
+			}
+
+			if (balanceDecision == BalancingDecision.YES_DEFERRED) {
+				this.resetBalancingTimers(false);
+				this.changeState(State.BALANCING_WANTED);				
+				break;
+			}
+
+			// Check if balancing duration has passed
+			if (this.isBalancingDurationExceeded()) {
+				// Balancing time is over, transition to NORMAL state
+				this.resetBalancingTimers(true);
+				this.changeState(State.NORMAL);
+
+			} else {
+				this.balancingRemainingTime = (int) (this.balancingHysteresisTime - this.balancingTime);
+				this.logDebug(this.log, "Balancing active since " + this.balancingStartTime + "|Remaining: "
+						+ this.balancingRemainingTime + "s \n");
+
+				//
+				this._setBalancingRemainingSeconds(this.balancingRemainingTime);
+
+				if (this.currentSoc < (BALANCING_SOC - 1)) {
+					// SOC dropped below forceChargeSoc: reset balancing
+					this.logDebug(this.log, "SOC dropped below " + BALANCING_SOC + "%. Restarting balancing.");
+					this.changeState(State.BALANCING_WANTED);
+					this.resetBalancingTimers(false);
+					break;
+				} else if (this.currentSoc <= (BALANCING_SOC + 1)) {
+					// SOC slightly below target, maintain SOC with force charging
+					calculatedPower = this.forceChargePower * -1; // Charging has a negative value
+				} else {
+					// SOC is sufficient, no charging or discharging needed
+					calculatedPower = 0; // block further discharging if SOC is sufficient
+				}
+
+			}
+			break;
+
+		case BALANCING_WANTED:
+			// State can be used to check things. Don´t know what, yet ;o)
+
+			calculatedPower = null;
+			// Check again if balancing is necessary
+			if (balanceDecision == BalancingDecision.NO) {
+				this.changeState(State.NORMAL);
+				break;
+			}
+
+			if (balanceDecision == BalancingDecision.YES_DEFERRED) {
+				// Avoid discharge below minSoc
+				if (this.currentSoc <= this.minSoc) { // min guard
+					calculatedPower = 0;
+				} else if (currentBatteryPower > 0 && this.currentSoc <= (this.minSoc + TAPER_PERCENT)) {
+					this.logDebug(this.log, "Approaching min. SoC limit : " + this.currentSoc + "%/" + this.minSoc + "%");
+
+					lin = (float) (this.currentSoc - this.minSoc) / (float) TAPER_PERCENT; // 0..1
+					taperFactor = lin * lin;
+					calculatedPower = Math.round(this.fullDischargePower * taperFactor); // positiv
+					calculatedPower = Math.max(calculatedPower, this.slowDischargePower);
+					break;
+				}
+
+				break;
+			}
+
+			if (balanceDecision == BalancingDecision.YES) {
+				this.changeState(State.FORCE_CHARGE_ACTIVE);
+			}
+			break;
+		default:
+			this.logDebug(this.log, "Case is not handled");
+			break;
+
+		}
+		// this.applyActivePowerConstraint(calculatedPower);
+
+		Integer rampedPower = calculatedPower;
+
+		//
+		if (this.state == State.APPROACHING_MAX_SOC || this.state == State.APPROACHING_MIN_SOC) {
+			Float target = calculatedPower != null ? calculatedPower.floatValue() : null;
+			rampedPower = this.rampFilter.getFilteredValueAsInteger(target, this.rampPowerW);
+
+			this.logDebug(this.log, "[RAMP] state=" + this.state + " | target=" + calculatedPower + "W"
+					+ " | rampPowerW=" + this.rampPowerW + " -> ramped=" + rampedPower + "W \n");
+
+		}
+
+		this.applyActivePowerConstraint(rampedPower);
+		this.calculateChargedEnergy();
+
+		this._setMaxSoc(this.maxSoc);
+		this._setMinSoc(this.minSoc);
+		this._setBalancingSoc(BALANCING_SOC);
+
+		// save current state channel
+		this._setStateMachine(this.state);
+
+		this.logDebug(this.log,
+				this.config.id() + "Current State " + this.state.getName() + "\n" + this.config.id() + "Current SoC "
+						+ this.ess.getSoc().get() + "% \n" + this.config.id() + "Current ActivePower "
+						+ this.ess.getActivePower().get() + "W (battery " + currentBatteryPower + "W, PV "
+						+ this.pvPower + "W) \n" + this.config.id() + "Calculated battery power "
+						+ calculatedPower + "W \n" + this.config.id() + "Energy charged since last balancing "
+						+ this.getChargedEnergy().get() + "Wh \n");
+
+	}
+
+
+	private String formatAcPower(int acPower, int batteryPower) {
+		return acPower + "W (battery " + batteryPower + "W + PV " + this.pvPower + "W)";
+	}
+
+	/**
+	 * Applies constraints to ess. Even FORCE_CHARGE is a constraint as the ESS is
+	 * allowed to charge more than this controller´s desired value.
+	 * 
+	 * 
+	 * @param calculatedPower as constraint
+	 */
+	void applyActivePowerConstraint(Integer calculatedPower) {
+		// Make the limitation visible in the UI/history: which direction is
+		// limited and which battery power is still allowed.
+		boolean dischargeLimited = calculatedPower != null && switch (this.state) {
+		case MIN_SOC_REACHED, BELOW_MIN_SOC, APPROACHING_MIN_SOC, BALANCING_ACTIVE, FORCE_CHARGE_ACTIVE -> true;
+		default -> false;
+		};
+		boolean chargeLimited = calculatedPower != null && switch (this.state) {
+		case MAX_SOC_REACHED, ABOVE_MAX_SOC, APPROACHING_MAX_SOC -> true;
+		default -> false;
+		};
+		this.channel(ControllerEssChargeDischargeLimiter.ChannelId.DISCHARGE_LIMITED).setNextValue(dischargeLimited);
+		this.channel(ControllerEssChargeDischargeLimiter.ChannelId.CHARGE_LIMITED).setNextValue(chargeLimited);
+		this.channel(ControllerEssChargeDischargeLimiter.ChannelId.LIMITED_BATTERY_POWER)
+				.setNextValue(dischargeLimited || chargeLimited ? calculatedPower : null);
+
+
+		if (this.ess == null) {
+			this.logDebug(this.log, "ERROR. No Ess to apply constraints to");
+			return;
+		}
+
+		try {
+			
+			if (calculatedPower == null) {
+				this.logDebug(this.log, "CalculatedPower is null. No constraints will be set");
+				return; // No constraints to set
+			}
+			
+			// calculatedPower is battery power; the ESS constraint is AC = battery + PV
+			int acPower = calculatedPower + this.pvPower;
+			
+			switch (this.state) {
+			case MAX_SOC_REACHED, ABOVE_MAX_SOC -> { // Block further charging
+				this.ess.setActivePowerGreaterOrEquals(acPower);
+				this.logDebug(this.log, "ApplyPowerMethod -> setActivePowerGreaterOrEquals "
+						+ this.formatAcPower(acPower, calculatedPower));
+
+			}
+
+			case MIN_SOC_REACHED, BELOW_MIN_SOC -> { // Block further discharging
+				this.ess.setActivePowerLessOrEquals(acPower);
+				this.logDebug(this.log, "ApplyPowerMethod -> setActivePowerLessOrEquals "
+						+ this.formatAcPower(acPower, calculatedPower));
+
+			}
+
+			case BALANCING_ACTIVE -> {
+				// Fit calculated power within min/max limits and apply
+				acPower = this.ess.getPower().fitValueIntoMinMaxPower(this.id(), this.ess, SingleOrAllPhase.ALL,
+						Pwr.ACTIVE, acPower);
+				this.ess.setActivePowerLessOrEquals(acPower);
+				this.logDebug(this.log,
+						"BALANCING_ACTIVE ApplyPowerMethod -> setActivePowerLessOrEquals "
+						+ this.formatAcPower(acPower, calculatedPower));
+
+			}
+
+			case FORCE_CHARGE_ACTIVE -> {
+				// Fit calculated power within min/max limits and apply
+				acPower = this.ess.getPower().fitValueIntoMinMaxPower(this.id(), this.ess, SingleOrAllPhase.ALL,
+						Pwr.ACTIVE, acPower);
+				this.ess.setActivePowerLessOrEquals(acPower);
+				this.logDebug(this.log,
+						"FORCE_CHARGE_ACTIVE ApplyPowerMethod -> setActivePowerLessOrEquals "
+						+ this.formatAcPower(acPower, calculatedPower));
+
+			}
+
+			case APPROACHING_MAX_SOC -> {
+				this.ess.setActivePowerGreaterOrEquals(acPower); // reduced power
+				this.logDebug(this.log,
+						"APPROACHING_MAX_SOC< ApplyPowerMethod -> setActivePowerGreaterOrEquals "
+						+ this.formatAcPower(acPower, calculatedPower));
+			}
+			case APPROACHING_MIN_SOC -> {
+				this.ess.setActivePowerLessOrEquals(acPower); // reduced power
+				this.logDebug(this.log,
+						"APPROACHING_MIN_SOC ApplyPowerMethod -> setActivePowerLessOrEquals "
+						+ this.formatAcPower(acPower, calculatedPower));
+			}
+			case NORMAL -> { // no constraint needed in normal operation
+			}
+			case BALANCING_WANTED -> {
+
+				if (this.currentSoc <= this.minSoc) {
+					this.ess.setActivePowerLessOrEquals(acPower);
+					this.logDebug(this.log,
+							"BALANCING_WANTED ApplyPowerMethod -> setActivePowerLessOrEquals "
+						+ this.formatAcPower(acPower, calculatedPower));
+				} else if (this.currentSoc >= this.maxSoc) {
+					this.ess.setActivePowerGreaterOrEquals(acPower);
+					this.logDebug(this.log,
+							"BALANCING_WANTED ApplyPowerMethod -> setActivePowerGreaterOrEquals "
+						+ this.formatAcPower(acPower, calculatedPower));
+				}
+			}
+			case UNDEFINED -> { // do nothing
+			}
+			case ERROR -> { // do nothing
+			}
+			default -> throw new IllegalArgumentException("Unexpected State: " + this.state);
+			}
+		} catch (OpenemsNamedException e) {
+			// ToDo: Handle exceptions, add logging
+			e.printStackTrace();
+		}
+	}
+
+	private void resetBalancingTimers(boolean fullReset) {
+		this.logDebug(this.log, "\nBalancing finished or aborted. Resetting timers ");
+		this.balancingStartTime = Instant.MIN; // Reset balancing start time
+		this.balancingRemainingTime = this.balancingHysteresisTime; // Reset remaining balancing time
+
+		if (fullReset) {
+			this.logDebug(this.log, "\nBalancing finished. Going back to normal operation. Energy counters ");
+			this.resetChargedEnergy = true; // Flag to reset charged energy
+			this.cumulatedchargedEnergy = 0; // Optional: reset cumulative charge energy here
+		}
+
+	}
+
+	private boolean isBalancingDurationExceeded() {
+		// calculate balancing time so far to seconds
+		this.balancingTime = Duration.between(this.balancingStartTime, Instant.now(this.componentManager.getClock()))
+				.getSeconds();
+
+		return this.balancingTime >= this.balancingHysteresisTime;
+	}
+
+	private boolean isWithinPriceLimit() {
+		Integer currentPrice = 0;
+
+		if (this.config.maxPrice() == 0) {
+			return true;
+		}
+
+		if (this.timeOfUseTariff == null) {
+			this.log.warn("TimeOfUseTariff service is null.");
+			return true; // Ignore check if no ToU controller is available and no price can be obtained
+		}
+
+		Double firstPrice = this.timeOfUseTariff.getPrices().getFirst();
+		if (firstPrice == null) {
+			this.log.warn("TimeOfUseTariff has no price data available.");
+			return true; // Ignore check if no price can be obtained
+		}
+		currentPrice = (int) Math.round(firstPrice / 10); // Price in €/MWh. Divided to ct/kWh
+		// balancing is not desired
+		if (currentPrice > this.config.maxPrice()) {
+			this.logDebug(this.log, "Balancing is deactivated due to high price. Configured limit: "
+					+ this.config.maxPrice() + " Current price: " + currentPrice + "[ct/kWh]");
+			return false;
+		}
+		return true;
+
+	}
+
+	/**
+	 * Calculates if the battery needs too be balanced. This depends on charged
+	 * energy since the last balancing procedure. If charged energy exceeds
+	 * configured energy method returns true.
+	 * 
+	 * <p>
+	 * Balancing is blocked if a Peakshaver is active. "Active" means that it is in
+	 * operating state - not neccessaryly active discharging the battery
+	 * 
+	 * @return if battery should be balanced
+	 */
+	private BalancingDecision shouldBalance() {
+
+		Integer chargedEnergy = this.getChargedEnergy().get();
+
+		if (chargedEnergy == null) {
+			this.logDebug(this.log, "ERROR: Cannot determine charged energy");
+			this._setBalancingDeferralReason(BalancingDeferralReason.NONE);
+			return BalancingDecision.NO;
+		}
+
+		// balancing is not desired
+		if (this.config.energyBetweenBalancingCycles() == 0) {
+			this.logDebug(this.log, "Balancing is deactivated due to config setting");
+			this._setBalancingDeferralReason(BalancingDeferralReason.NONE);
+			return BalancingDecision.NO;
+		}
+		/*
+		 * if (this.state == State.BALANCING_ACTIVE) { this.logDebug(this.log,
+		 * "Balancing already active"); return true; }
+		 */
+		if (chargedEnergy > this.energyBetweenBalancingCycles) {
+			this.logDebug(this.log, "Balancing necessary because charged energy between balancing cycles exceeded");
+			// are there any peakshavers active
+			if (this.isPeakshavingActive()) {
+				this.logDebug(this.log, "Balancing is deferred due to active peakshaving");
+				this._setBalancingDeferralReason(BalancingDeferralReason.PEAKSHAVING);
+				return BalancingDecision.YES_DEFERRED;
+			}
+
+			if (!this.isWithinPriceLimit()) {
+				this.logDebug(this.log, "Balancing is deferred due to high energy costs");
+				this._setBalancingDeferralReason(BalancingDeferralReason.PRICE_LIMIT);
+				return BalancingDecision.YES_DEFERRED;
+			}
+
+			this._setBalancingDeferralReason(BalancingDeferralReason.NONE);
+			return BalancingDecision.YES;
+
+		}
+
+		this.logDebug(this.log, "No Balancing necessary");
+		this._setBalancingDeferralReason(BalancingDeferralReason.NONE);
+		return BalancingDecision.NO;
+	}
+	
+	private boolean changeState(State nextState) {
+		return this.changeState(nextState, false);
+	}
+
+	/**
+	 * Changes the state if hysteresis time passed, to avoid too quick changes.
+	 *
+	 * @param nextState the target state
+	 * @return whether the state was changed
+	 */
+	private boolean changeState(State nextState, boolean skipHysteresis) {
+		this.logDebug(this.log, "Change state " + this.state + "->" + nextState
+				+ (skipHysteresis ? " without hysteresis" : ""));
+		if (this.state == nextState) {
+			this._setAwaitingHysteresisValue(false);
+			return false;
+		}
+		
+		if (skipHysteresis || Duration.between(//
+				this.lastStateChangeTime, //
+				Instant.now(this.componentManager.getClock()) //
+		).toSeconds() >= HYSTERESIS) {
+			this.state = nextState;
+			this.lastStateChangeTime = Instant.now(this.componentManager.getClock());
+			this._setAwaitingHysteresisValue(false);
+			return true;
+		} else {
+			this._setAwaitingHysteresisValue(true);
+			return false;
+		}
+	}
+
+	private void calculateChargedEnergy() {
+
+		Long currentEssActiveChargeEnergy = 0L;
+
+		currentEssActiveChargeEnergy = this.getEssChargedEnergy().get(); // Cumulative counter of ESS device. No matter
+																			// if DC or AC coupled
+
+		// Ess Active Charge Energy directly from ESS (cumulative)
+		Integer storedChargedEnergy = this.getChargedEnergy().get(); // Stored charged energy from this controller's
+																		// channel
+
+		// Early exit if any data is not available
+		if (currentEssActiveChargeEnergy == null || storedChargedEnergy == null) {
+			this.initializeChargedEnergyFromTimedata();
+			return;
+		}
+
+		// If it's the first time or if the lastEssActiveChargeEnergy is null,
+		// initialize it
+		if (this.lastEssActiveChargeEnergy == null) {
+			this.lastEssActiveChargeEnergy = currentEssActiveChargeEnergy;
+			return;
+		}
+
+		// The ESS/BMS cumulative counter can drop (e.g. after a device restart that
+		// resets its lifetime counter). Resync without applying a negative delta,
+		// instead of corrupting the balancing energy bookkeeping.
+		if (currentEssActiveChargeEnergy < this.lastEssActiveChargeEnergy) {
+			this.logDebug(this.log,
+					"ESS charge energy counter decreased (device reset?). Resyncing without adding a delta.");
+			this.lastEssActiveChargeEnergy = currentEssActiveChargeEnergy;
+			return;
+		}
+
+		// Calculate energy difference
+		int energyDifference = (int) (currentEssActiveChargeEnergy - this.lastEssActiveChargeEnergy);
+
+		// Update charged energy by adding the difference
+		this.cumulatedchargedEnergy = storedChargedEnergy + energyDifference;
+
+		// Update the last known cumulative energy
+		this.lastEssActiveChargeEnergy = currentEssActiveChargeEnergy;
+
+		// If reset is flagged (e.g., calibration completed), reset the charged energy
+		if (this.resetChargedEnergy) {
+			this.cumulatedchargedEnergy = 0;
+			this.resetChargedEnergy = false;
+		}
+		this.logDebug(this.log, "Writing charged energy " + this.cumulatedchargedEnergy + "[Wh]");
+		// Set the updated charged energy in the controller's channel
+		this._setChargedEnergy(this.cumulatedchargedEnergy);
+
+	}
+
+	/**
+	 * Uses Info Log for further debug features.
+	 */
+	@Override
+	protected void logDebug(Logger log, String message) {
+		if (this.debugMode) {
+			this.logInfo(this.log, message);
+		}
+	}
+
+	/**
+	 * Calculation of useable Soc and Capacity. Channels are stored in this
+	 * controller and not in the device as we cannot be sure that they exist.
+	 * 
+	 * @param soc the current SoC
+	 */
+	private void updateUsableSocAndCapacity(Integer soc) {
+		if (this.ess == null) {
+			this.logDebug(this.log, "Cannot calculate usable SoC: ESS is null");
+			return;
+		}
+
+		if (soc == null) {
+			this.logDebug(this.log, "Cannot calculate usable SoC: SoC is null");
+			return;
+		}
+
+		Integer totalCapacityWh = this.ess.getCapacity().get();
+
+		if (totalCapacityWh == null) {
+			this.logDebug(this.log, "Cannot calculate usable SoC: totalCapacityWh is null");
+			return;
+		}
+
+		// Min/Max SoC-borders from config
+		int minSocPercentage = this.minSoc;
+		int maxSocPercentage = this.maxSoc;
+
+		if (maxSocPercentage <= minSocPercentage) {
+			this.logDebug(this.log, "Invalid SoC window: minSoc=" + minSocPercentage + ", maxSoc=" + maxSocPercentage);
+			return;
+		}
+
+		// normalize
+		int useableSoc = soc > maxSocPercentage ? 100
+				: soc < minSocPercentage ? 0
+						: (int) (((double) (soc - minSocPercentage) / (maxSocPercentage - minSocPercentage)) * 100);
+
+		this.logDebug(this.log, "Normalized usable SoC: " + useableSoc + "% based on current SoC: " + soc);
+
+		double usableCapacityRange = (maxSocPercentage - minSocPercentage) / 100.0;
+		int totalUsableCapacityWh = (int) (totalCapacityWh * usableCapacityRange);
+
+		int useableCapacityWh = (int) (totalUsableCapacityWh * (useableSoc / 100.0));
+
+		// Clamp 0..totalUsableCapacityWh
+		useableCapacityWh = Math.max(Math.min(useableCapacityWh, totalUsableCapacityWh), 0);
+
+		// feed channels
+		this._setUseableSoc(useableSoc);
+		this._setUseableCapacity(useableCapacityWh);
+
+		this.logDebug(this.log, "Capacity info: totalCapacity=" + totalCapacityWh + "Wh, usableRange="
+				+ totalUsableCapacityWh + "Wh, currentUsableCapacity=" + useableCapacityWh + "Wh");
+	}
+
+	private boolean isPeakshavingActive() {
+		// Threshold-Peakshaver ist in diesem Branch nicht vorhanden
+		return false;
+	}
+
+	@Override
+	public String getEssId() {
+		if (this.ess == null) {
+			return null;
+		} else {
+			return this.ess.id();
+		}
+
+	}
+	
+	private Value<Long> getEssChargedEnergy() {
+		if (this.ess instanceof HybridEss hss) {
+			return hss.getDcChargeEnergy();
+		} else {
+			return this.ess.getActiveChargeEnergy();
+		}
+	}
+	
+	@Override
+	public EnergyScheduleHandler getEnergyScheduleHandler() {
+		return this.energyScheduleHandler;
+	}
+
+	@Override
+	public ModbusSlaveTable getModbusSlaveTable(AccessMode accessMode) {
+		return new ModbusSlaveTable(OpenemsComponent.getModbusSlaveNatureTable(accessMode), ModbusSlaveNatureTable
+				.of(ControllerEssChargeDischargeLimiter.class, accessMode, 100) //
+				.channel(0, ControllerEssChargeDischargeLimiter.ChannelId.USEABLE_CAPACITY, ModbusType.UINT16)
+				.channel(1, ControllerEssChargeDischargeLimiter.ChannelId.USEABLE_SOC, ModbusType.UINT16)
+				.channel(2, ControllerEssChargeDischargeLimiter.ChannelId.CHARGED_ENERGY, ModbusType.UINT16)
+				.channel(3, ControllerEssChargeDischargeLimiter.ChannelId.AWAITING_HYSTERESIS, ModbusType.UINT16)
+				.channel(4, ControllerEssChargeDischargeLimiter.ChannelId.STATE_MACHINE, ModbusType.UINT16)
+				.channel(5, ControllerEssChargeDischargeLimiter.ChannelId.BALANCING_REMAINING_SECONDS,
+						ModbusType.UINT16)
+				.channel(6, ControllerEssChargeDischargeLimiter.ChannelId.BALANCING_DEFERRAL_REASON,
+						ModbusType.UINT16)
+
+				.build());
+	}
+
+}

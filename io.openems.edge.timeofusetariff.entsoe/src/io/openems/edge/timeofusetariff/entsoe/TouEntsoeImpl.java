@@ -58,6 +58,7 @@ public class TouEntsoeImpl extends AbstractOpenemsComponent implements TouEntsoe
 	private ComponentManager componentManager;
 
 	private TouManualHelper helper = TouManualHelper.EMPTY_TOU_MANUAL_HELPER;
+	private volatile PriceCalculatorXY priceCalculator = PriceCalculatorXY.fromExpression("x + y");
 	private EntsoeMarketPriceProvider priceProvider;
 
 	private final Consumer<MarketPriceUpdateEvent> onUpdateEvent = this::onUpdateEvent;
@@ -95,6 +96,7 @@ public class TouEntsoeImpl extends AbstractOpenemsComponent implements TouEntsoe
 		}
 
 		this.applySchedule(config);
+		this.priceCalculator = PriceCalculatorXY.fromExpression(config.calculateExpression());
 
 		this.priceProvider = this.entsoeMarketPriceProviderPool
 				.get(new EntsoeConfiguration(config.biddingZone(), config.securityToken()));
@@ -165,7 +167,8 @@ public class TouEntsoeImpl extends AbstractOpenemsComponent implements TouEntsoe
 		final double exchangeRate = getExchangeRateOrElse(marketPriceData.getCurrency(), globalCurrency, 1.);
 		final var gridFees = this.helper.getPrices();
 
-		final var processedPrices = Utils.processPrices(this.componentManager.getClock(), marketPriceData.getValues(),
+		final var processedPrices = Utils.processPrices(this.componentManager.getClock(), this.priceCalculator,
+				marketPriceData.getValues(),
 				exchangeRate, gridFees);
 		this.prices.set(processedPrices);
 	}

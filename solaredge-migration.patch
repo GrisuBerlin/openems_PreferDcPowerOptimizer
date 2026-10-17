@@ -1,0 +1,359 @@
+diff --git a/io.openems.edge.controller.ess.chargedischargelimiter/bnd.bnd b/io.openems.edge.controller.ess.chargedischargelimiter/bnd.bnd
+index 568c2d7..e5a433a 100644
+--- a/io.openems.edge.controller.ess.chargedischargelimiter/bnd.bnd
++++ b/io.openems.edge.controller.ess.chargedischargelimiter/bnd.bnd
+@@ -13,7 +13,6 @@ Bundle-Version: 1.0.0.${tstamp}
+ 	io.openems.edge.timedata.api,\
+ 	io.openems.edge.controller.ess.limittotaldischarge,\
+ 	io.openems.edge.controller.ess.emergencycapacityreserve,\
+-	io.openems.edge.controller.symmetric.thresholdpeakshaver,\
+ 	io.openems.edge.timeofusetariff.api,\
+ 	io.openems.edge.energy.api
+ -testpath: \
+diff --git a/io.openems.edge.controller.ess.chargedischargelimiter/src/io/openems/edge/controller/ess/chargedischargelimiter/ControllerEssChargeDischargeLimiterImpl.java b/io.openems.edge.controller.ess.chargedischargelimiter/src/io/openems/edge/controller/ess/chargedischargelimiter/ControllerEssChargeDischargeLimiterImpl.java
+index ec123d5..e740141 100644
+--- a/io.openems.edge.controller.ess.chargedischargelimiter/src/io/openems/edge/controller/ess/chargedischargelimiter/ControllerEssChargeDischargeLimiterImpl.java
++++ b/io.openems.edge.controller.ess.chargedischargelimiter/src/io/openems/edge/controller/ess/chargedischargelimiter/ControllerEssChargeDischargeLimiterImpl.java
+@@ -41,7 +41,6 @@ import io.openems.edge.ess.power.api.Pwr;
+ import io.openems.edge.common.type.TypeUtils;
+ 
+ import io.openems.edge.timedata.api.Timedata;
+-import io.openems.edge.controller.symmetric.thresholdpeakshaver.ControllerEssThresholdPeakshaver;
+ import io.openems.edge.controller.ess.chargedischargelimiter.enums.BalancingDecision;
+ import io.openems.edge.controller.ess.chargedischargelimiter.enums.BalancingDeferralReason;
+ import io.openems.edge.controller.ess.chargedischargelimiter.enums.State;
+@@ -121,11 +120,6 @@ public class ControllerEssChargeDischargeLimiterImpl extends AbstractOpenemsComp
+ 	@Reference(policy = ReferencePolicy.STATIC, policyOption = ReferencePolicyOption.GREEDY, cardinality = ReferenceCardinality.MANDATORY)
+ 	private ManagedSymmetricEss ess;
+ 
+-	@Reference(policyOption = ReferencePolicyOption.GREEDY, //
+-			cardinality = ReferenceCardinality.MULTIPLE, //
+-			target = "(enabled=true)")
+-	private List<ControllerEssThresholdPeakshaver> ctrlEssThresholdPeakshavers = new CopyOnWriteArrayList<>();
+-
+ 	@Reference(policyOption = ReferencePolicyOption.GREEDY, //
+ 			cardinality = ReferenceCardinality.OPTIONAL, //
+ 			target = "(enabled=true)")
+@@ -345,7 +339,6 @@ public class ControllerEssChargeDischargeLimiterImpl extends AbstractOpenemsComp
+ 		float lin = 0f;
+ 
+ 		// Remember: Negative values for Charge; positive for Discharge
+-		this.logDebug(this.log, "Number of Peakshaving controllers found: " + this.ctrlEssThresholdPeakshavers.size());
+ 
+ 		switch (this.state) {
+ 		case UNDEFINED:
+@@ -1057,28 +1050,7 @@ public class ControllerEssChargeDischargeLimiterImpl extends AbstractOpenemsComp
+ 	}
+ 
+ 	private boolean isPeakshavingActive() {
+-		// Check all connected peakshaving controllers to determine if any are active
+-		if (this.ctrlEssThresholdPeakshavers == null || this.ctrlEssThresholdPeakshavers.isEmpty()) {
+-			this.logDebug(this.log, "No peakshaving controllers connected.");
+-			return false;
+-		}
+-
+-		for (ControllerEssThresholdPeakshaver peakshaver : this.ctrlEssThresholdPeakshavers) {
+-			if (peakshaver == null) {
+-				this.logDebug(this.log, "ERROR: A peakshaver instance is null.");
+-				continue; // Skip null entries without breaking the loop
+-			}
+-
+-			String state = peakshaver.getStateMachine() != null ? peakshaver.getStateMachine().toString() : "null";
+-			this.logDebug(this.log, "Peakshaver state: " + state);
+-
+-			if ("PEAKSHAVING_ACTIVE".equals(state)) { // Use .equals for string comparison
+-				this.logDebug(this.log, "Peakshaving Controller " + peakshaver.alias() + " is active.");
+-				return true;
+-			}
+-		}
+-
+-		this.logDebug(this.log, "No active peakshaving controllers detected.");
++		// Threshold-Peakshaver ist in diesem Branch nicht vorhanden
+ 		return false;
+ 	}
+ 
+diff --git a/io.openems.edge.solaredge/src/io/openems/edge/solaredge/charger/SolaredgeDcChargerImpl.java b/io.openems.edge.solaredge/src/io/openems/edge/solaredge/charger/SolaredgeDcChargerImpl.java
+index d1b3290..247f3df 100644
+--- a/io.openems.edge.solaredge/src/io/openems/edge/solaredge/charger/SolaredgeDcChargerImpl.java
++++ b/io.openems.edge.solaredge/src/io/openems/edge/solaredge/charger/SolaredgeDcChargerImpl.java
+@@ -2,6 +2,7 @@ package io.openems.edge.solaredge.charger;
+ 
+ import java.util.Map;
+ 
++import org.osgi.service.cm.ConfigurationAdmin;
+ import org.osgi.service.component.ComponentContext;
+ import org.osgi.service.component.annotations.Activate;
+ import org.osgi.service.component.annotations.Component;
+@@ -55,7 +56,6 @@ import io.openems.edge.timedata.api.Timedata;
+ import io.openems.edge.timedata.api.TimedataProvider;
+ import io.openems.edge.timedata.api.utils.CalculateEnergyFromPower;
+ 
+-import io.openems.common.referencetarget.GenerateTargetsFromReferences;
+ 
+ @Designate(ocd = Config.class, factory = true)
+ @Component(//
+@@ -69,7 +69,6 @@ import io.openems.common.referencetarget.GenerateTargetsFromReferences;
+ 		EdgeEventConstants.TOPIC_CYCLE_BEFORE_CONTROLLERS //
+ })
+ 
+-@GenerateTargetsFromReferences("ess")
+ public class SolaredgeDcChargerImpl extends AbstractSunSpecDcCharger implements SolaredgeDcCharger, EssDcCharger,
+ 		ModbusComponent, OpenemsComponent, EventHandler, TimedataProvider, ModbusSlave {
+ 
+@@ -95,6 +94,9 @@ public class SolaredgeDcChargerImpl extends AbstractSunSpecDcCharger implements
+ 	private boolean isLimiting = false;
+ 
+ 
++	@Reference
++	private ConfigurationAdmin cm;
++
+ 	@Reference(policy = ReferencePolicy.DYNAMIC, policyOption = ReferencePolicyOption.GREEDY, cardinality = ReferenceCardinality.OPTIONAL)
+ 	private volatile Timedata timedata = null;
+ 	
+@@ -122,7 +124,13 @@ public class SolaredgeDcChargerImpl extends AbstractSunSpecDcCharger implements
+ 	void activate(ComponentContext context, Config config) throws OpenemsException {
+ 	    this.config = config;
+ 
+-	    super.activate(context, config.id(), config.alias(), config.enabled(),this.ess.getUnitId(), READ_FROM_MODBUS_BLOCK);
++	    if (OpenemsComponent.updateReferenceFilter(this.cm, this.servicePid(), "ess", config.ess_id())) {
++	        return;
++	    }
++	    if (super.activate(context, config.id(), config.alias(), config.enabled(), this.ess.getUnitId(), this.cm,
++	            "Modbus", this.ess.getModbusBridgeId(), READ_FROM_MODBUS_BLOCK)) {
++	        return;
++	    }
+ 
+ 	    this.ess.addCharger(this);
+ 
+diff --git a/io.openems.edge.solaredge/src/io/openems/edge/solaredge/common/AbstractSunSpecDcCharger.java b/io.openems.edge.solaredge/src/io/openems/edge/solaredge/common/AbstractSunSpecDcCharger.java
+index 264a2d4..52e3dda 100644
+--- a/io.openems.edge.solaredge/src/io/openems/edge/solaredge/common/AbstractSunSpecDcCharger.java
++++ b/io.openems.edge.solaredge/src/io/openems/edge/solaredge/common/AbstractSunSpecDcCharger.java
+@@ -15,6 +15,7 @@ import io.openems.edge.common.taskmanager.Priority;
+ import io.openems.edge.ess.dccharger.api.EssDcCharger;
+ import org.slf4j.Logger;
+ import org.slf4j.LoggerFactory;
++import org.osgi.service.cm.ConfigurationAdmin;
+ import org.osgi.service.component.ComponentContext;
+ import org.osgi.service.component.annotations.Deactivate;
+ 
+@@ -56,9 +57,11 @@ public abstract class AbstractSunSpecDcCharger extends AbstractOpenemsSunSpecCom
+ 	 * @throws OpenemsException on error
+ 	 */
+     @Override
+-    protected void activate(ComponentContext context, String id, String alias, boolean enabled, int unitId,
+-            int readFromCommonBlockNo) throws OpenemsException {
+-        super.activate(context, id, alias, enabled, unitId, readFromCommonBlockNo);
++    protected boolean activate(ComponentContext context, String id, String alias, boolean enabled, int unitId,
++            ConfigurationAdmin cm, String modbusReference, String modbusId, int readFromCommonBlockNo)
++            throws OpenemsException {
++        return super.activate(context, id, alias, enabled, unitId, cm, modbusReference, modbusId,
++                readFromCommonBlockNo);
+     }
+ 
+ 	/**
+diff --git a/io.openems.edge.solaredge/src/io/openems/edge/solaredge/common/AbstractSunSpecEss.java b/io.openems.edge.solaredge/src/io/openems/edge/solaredge/common/AbstractSunSpecEss.java
+index fc5000c..b53c097 100644
+--- a/io.openems.edge.solaredge/src/io/openems/edge/solaredge/common/AbstractSunSpecEss.java
++++ b/io.openems.edge.solaredge/src/io/openems/edge/solaredge/common/AbstractSunSpecEss.java
+@@ -4,6 +4,7 @@ package io.openems.edge.solaredge.common;
+ import java.util.Map;
+ import java.util.Optional;
+ 
++import org.osgi.service.cm.ConfigurationAdmin;
+ import org.osgi.service.component.ComponentContext;
+ import org.osgi.service.component.annotations.Deactivate;
+ import org.slf4j.Logger;
+@@ -36,9 +37,11 @@ public abstract class AbstractSunSpecEss extends AbstractOpenemsSunSpecComponent
+      * Make sure to call this method from the inheriting OSGi Component.
+      */
+     @Override
+-    protected void activate(ComponentContext context, String id, String alias, boolean enabled, int unitId,
+-            int readFromCommonBlockNo) throws OpenemsException {
+-        super.activate(context, id, alias, enabled, unitId, readFromCommonBlockNo);
++    protected boolean activate(ComponentContext context, String id, String alias, boolean enabled, int unitId,
++            ConfigurationAdmin cm, String modbusReference, String modbusId, int readFromCommonBlockNo)
++            throws OpenemsException {
++        return super.activate(context, id, alias, enabled, unitId, cm, modbusReference, modbusId,
++                readFromCommonBlockNo);
+     }
+ 
+ 
+diff --git a/io.openems.edge.solaredge/src/io/openems/edge/solaredge/gridmeter/AbstractSolarEdgeGridmeter.java b/io.openems.edge.solaredge/src/io/openems/edge/solaredge/gridmeter/AbstractSolarEdgeGridmeter.java
+index 382153f..4beb9da 100644
+--- a/io.openems.edge.solaredge/src/io/openems/edge/solaredge/gridmeter/AbstractSolarEdgeGridmeter.java
++++ b/io.openems.edge.solaredge/src/io/openems/edge/solaredge/gridmeter/AbstractSolarEdgeGridmeter.java
+@@ -36,9 +36,11 @@ public abstract class AbstractSolarEdgeGridmeter extends AbstractOpenemsSunSpecC
+      * Make sure to call this method from the inheriting OSGi Component.
+      */
+     @Override
+-    protected void activate(ComponentContext context, String id, String alias, boolean enabled, int unitId,
+-            int readFromCommonBlockNo) throws OpenemsException {
+-        super.activate(context, id, alias, enabled, unitId, readFromCommonBlockNo);
++    protected boolean activate(ComponentContext context, String id, String alias, boolean enabled, int unitId,
++            ConfigurationAdmin cm, String modbusReference, String modbusId, int readFromCommonBlockNo)
++            throws OpenemsException {
++        return super.activate(context, id, alias, enabled, unitId, cm, modbusReference, modbusId,
++                readFromCommonBlockNo);
+     }
+ 
+ 	/**
+diff --git a/io.openems.edge.solaredge/src/io/openems/edge/solaredge/gridmeter/SolarEdgeGridMeterImpl.java b/io.openems.edge.solaredge/src/io/openems/edge/solaredge/gridmeter/SolarEdgeGridMeterImpl.java
+index a03941e..4ebcb8e 100644
+--- a/io.openems.edge.solaredge/src/io/openems/edge/solaredge/gridmeter/SolarEdgeGridMeterImpl.java
++++ b/io.openems.edge.solaredge/src/io/openems/edge/solaredge/gridmeter/SolarEdgeGridMeterImpl.java
+@@ -2,6 +2,7 @@ package io.openems.edge.solaredge.gridmeter;
+ 
+ import java.util.Map;
+ 
++import org.osgi.service.cm.ConfigurationAdmin;
+ import org.osgi.service.component.ComponentContext;
+ import org.osgi.service.component.annotations.Activate;
+ import org.osgi.service.component.annotations.Component;
+@@ -22,7 +23,6 @@ import com.google.common.collect.ImmutableMap;
+ 
+ import io.openems.common.channel.AccessMode;
+ import io.openems.common.exceptions.OpenemsException;
+-import io.openems.common.referencetarget.GenerateTargetsFromReferences;
+ import io.openems.edge.bridge.modbus.api.BridgeModbus;
+ import io.openems.edge.bridge.modbus.api.ElementToChannelConverter;
+ import io.openems.edge.bridge.modbus.api.ModbusComponent;
+@@ -52,7 +52,6 @@ import io.openems.common.types.MeterType;
+ 		EdgeEventConstants.TOPIC_CYCLE_AFTER_PROCESS_IMAGE
+ })
+ 
+-@GenerateTargetsFromReferences("Modbus")
+ public class SolarEdgeGridMeterImpl extends AbstractSolarEdgeGridmeter
+ 		implements SolarEdgeGridMeter, ElectricityMeter, ModbusComponent, OpenemsComponent, ModbusSlave, EventHandler {
+ 
+@@ -96,12 +95,14 @@ public class SolarEdgeGridMeterImpl extends AbstractSolarEdgeGridmeter
+ 						)));
+ 	}
+ 
++	@Reference
++	private ConfigurationAdmin cm;
++
+ 	@Override
+ 	@Reference(//
+ 			policy = ReferencePolicy.STATIC, //
+ 			policyOption = ReferencePolicyOption.GREEDY, //
+-			cardinality = ReferenceCardinality.MANDATORY, //
+-			target = "(&(id=${config.modbus_id})(enabled=true))")
++			cardinality = ReferenceCardinality.MANDATORY)
+ 	protected void setModbus(BridgeModbus modbus) {
+ 		super.setModbus(modbus);
+ 	}
+@@ -136,8 +137,10 @@ public class SolarEdgeGridMeterImpl extends AbstractSolarEdgeGridmeter
+ 	
+ 	@Activate
+ 	private void activate(ComponentContext context, Config config) throws OpenemsException {
+-	    super.activate(context, config.id(), config.alias(), config.enabled(), config.modbusUnitId(),
+-	    		READ_FROM_MODBUS_BLOCK);
++	    if (super.activate(context, config.id(), config.alias(), config.enabled(), config.modbusUnitId(), this.cm,
++				"Modbus", config.modbus_id(), READ_FROM_MODBUS_BLOCK)) {
++			return;
++		}
+ 	    this.config = config;
+ 	}	
+ 
+diff --git a/io.openems.edge.solaredge/src/io/openems/edge/solaredge/hybrid/ess/SolarEdgeHybridEssImpl.java b/io.openems.edge.solaredge/src/io/openems/edge/solaredge/hybrid/ess/SolarEdgeHybridEssImpl.java
+index 6d40edb..09df081 100644
+--- a/io.openems.edge.solaredge/src/io/openems/edge/solaredge/hybrid/ess/SolarEdgeHybridEssImpl.java
++++ b/io.openems.edge.solaredge/src/io/openems/edge/solaredge/hybrid/ess/SolarEdgeHybridEssImpl.java
+@@ -3,6 +3,7 @@ package io.openems.edge.solaredge.hybrid.ess;
+ import static io.openems.edge.common.channel.ChannelUtils.setValue;
+ 
+ import java.util.Map;
++import org.osgi.service.cm.ConfigurationAdmin;
+ import org.osgi.service.component.ComponentContext;
+ import org.osgi.service.component.annotations.Activate;
+ import org.osgi.service.component.annotations.Component;
+@@ -143,6 +144,9 @@ public class SolarEdgeHybridEssImpl extends AbstractSunSpecEss implements SolarE
+ 	private int currentMaxChargePower = 0;
+ 	private int currentMaxDischargePower = 0;
+ 	
++	@Reference
++	private ConfigurationAdmin cm;
++
+ 	@Reference
+ 	private Power power;
+ 
+@@ -185,8 +189,10 @@ public class SolarEdgeHybridEssImpl extends AbstractSunSpecEss implements SolarE
+ 	@Activate
+ 	private void activate(ComponentContext context, Config config) throws OpenemsException {
+ 	    this.config = config;
+-	    super.activate(context, config.id(), config.alias(), config.enabled(), config.modbusUnitId(),
+-	            READ_FROM_MODBUS_BLOCK);
++	    if (super.activate(context, config.id(), config.alias(), config.enabled(), config.modbusUnitId(), this.cm,
++	            "Modbus", config.modbus_id(), READ_FROM_MODBUS_BLOCK)) {
++	        return;
++	    }
+ 
+ 
+ 			this.installListener();
+@@ -963,7 +969,22 @@ public class SolarEdgeHybridEssImpl extends AbstractSunSpecEss implements SolarE
+ 		return surplusPower;
+ 	}
+ 	
+-	/**
++		/**
++	 * PV production for {@link HybridEss#getPvProduction()} (used e.g. by the
++	 * PreferDcPower optimizer). Reads the DC charger without side effects.
++	 *
++	 * @return PV production power in Watts; null if not available
++	 */
++	@Override
++	public Integer getPvProduction() {
++		var c = this.charger;
++		if (c == null) {
++			return null;
++		}
++		return c.getActualPower().get();
++	}
++
++/**
+ 	 * Gets PV production power from charger.
+ 	 * 
+ 	 * @return PV production power in Watts
+diff --git a/io.openems.edge.solaredge/src/io/openems/edge/solaredge/pvinverter/SolarEdgePvInverterImpl.java b/io.openems.edge.solaredge/src/io/openems/edge/solaredge/pvinverter/SolarEdgePvInverterImpl.java
+index ed82652..0cf21b1 100644
+--- a/io.openems.edge.solaredge/src/io/openems/edge/solaredge/pvinverter/SolarEdgePvInverterImpl.java
++++ b/io.openems.edge.solaredge/src/io/openems/edge/solaredge/pvinverter/SolarEdgePvInverterImpl.java
+@@ -2,6 +2,7 @@ package io.openems.edge.solaredge.pvinverter;
+ 
+ import java.util.Map;
+ 
++import org.osgi.service.cm.ConfigurationAdmin;
+ import org.osgi.service.component.ComponentContext;
+ import org.osgi.service.component.annotations.Activate;
+ import org.osgi.service.component.annotations.Component;
+@@ -73,12 +74,14 @@ public class SolarEdgePvInverterImpl extends AbstractSunSpecPvInverter
+ 			.build();
+ 
+ 
++	@Reference
++	private ConfigurationAdmin cm;
++
+ 	@Override
+ 	@Reference(//
+ 			policy = ReferencePolicy.STATIC, //
+ 			policyOption = ReferencePolicyOption.GREEDY, //
+-			cardinality = ReferenceCardinality.MANDATORY, //
+-			target = "(&(id=${config.modbus_id})(enabled=true))")
++			cardinality = ReferenceCardinality.MANDATORY)
+ 	protected void setModbus(BridgeModbus modbus) {
+ 		super.setModbus(modbus);
+ 	}
+@@ -97,8 +100,10 @@ public class SolarEdgePvInverterImpl extends AbstractSunSpecPvInverter
+ 
+ 	@Activate
+ 	private void activate(ComponentContext context, Config config) throws OpenemsException {
+-	    super.activate(context, config.id(), config.alias(), config.enabled(), config.modbusUnitId(),
+-	            READ_FROM_MODBUS_BLOCK);
++	    if (super.activate(context, config.id(), config.alias(), config.enabled(), config.modbusUnitId(), this.cm,
++				"Modbus", config.modbus_id(), READ_FROM_MODBUS_BLOCK)) {
++			return;
++		}
+ 	}
+ 
+ 	@Override

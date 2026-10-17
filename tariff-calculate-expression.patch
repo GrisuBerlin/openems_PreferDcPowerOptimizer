@@ -1,0 +1,259 @@
+diff --git a/cnf/pom.xml b/cnf/pom.xml
+index bcce662..27b3d2d 100644
+--- a/cnf/pom.xml
++++ b/cnf/pom.xml
+@@ -225,6 +225,18 @@
+             <artifactId>rxjava</artifactId>
+             <version>3.1.12</version>
+         </dependency>
++        <dependency>
++            <!--
++            Javaluator is a simple, but powerful, infix expression evaluator for Java
++            Changelog: https://github.com/fathzer/javaluator/releases
++            Update files:
++            - io.openems.wrapper/bnd.bnd
++            - io.openems.wrapper/javaluator.bnd
++            -->
++            <groupId>com.fathzer</groupId>
++            <artifactId>javaluator</artifactId>
++            <version>3.0.6</version>
++        </dependency>
+         <dependency>
+             <!--
+             Jenetics - Java Genetic Algorithm Library
+diff --git a/io.openems.edge.timeofusetariff.entsoe/bnd.bnd b/io.openems.edge.timeofusetariff.entsoe/bnd.bnd
+index ae7ee9f..63a58a4 100644
+--- a/io.openems.edge.timeofusetariff.entsoe/bnd.bnd
++++ b/io.openems.edge.timeofusetariff.entsoe/bnd.bnd
+@@ -12,6 +12,7 @@ Bundle-Version: 1.0.0.${tstamp}
+ 	io.openems.edge.common,\
+ 	io.openems.edge.controller.api,\
+ 	io.openems.edge.timeofusetariff.api,\
++	io.openems.wrapper.javaluator,\
+ 
+ -testpath: \
+ 	org.jetbrains.kotlin.osgi-bundle,\
+diff --git a/io.openems.edge.timeofusetariff.entsoe/src/io/openems/edge/timeofusetariff/entsoe/Config.java b/io.openems.edge.timeofusetariff.entsoe/src/io/openems/edge/timeofusetariff/entsoe/Config.java
+index 6b65003..fca183f 100644
+--- a/io.openems.edge.timeofusetariff.entsoe/src/io/openems/edge/timeofusetariff/entsoe/Config.java
++++ b/io.openems.edge.timeofusetariff.entsoe/src/io/openems/edge/timeofusetariff/entsoe/Config.java
+@@ -28,5 +28,8 @@ import org.osgi.service.metatype.annotations.ObjectClassDefinition;
+ 	@AttributeDefinition(name = "Ancillary Costs JSON", description = "Ancillary Costs in JSON format")
+ 	String ancillaryCosts();
+ 
++	@AttributeDefinition(name = "Mathematical expression to calculate gross price", description = "[x] is the EPEX price in [Currency/MWh], [y] the ancillary cost per period; defaults to \"x + y\"")
++	String calculateExpression() default "";
++
+ 	String webconsole_configurationFactory_nameHint() default "Time-Of-Use Tariff ENTSO-E [{id}]";
+ }
+\ No newline at end of file
+diff --git a/io.openems.edge.timeofusetariff.entsoe/src/io/openems/edge/timeofusetariff/entsoe/PriceCalculator.java b/io.openems.edge.timeofusetariff.entsoe/src/io/openems/edge/timeofusetariff/entsoe/PriceCalculator.java
+new file mode 100644
+index 0000000..f26654c
+--- /dev/null
++++ b/io.openems.edge.timeofusetariff.entsoe/src/io/openems/edge/timeofusetariff/entsoe/PriceCalculator.java
+@@ -0,0 +1,18 @@
++package io.openems.edge.timeofusetariff.entsoe;
++
++import com.fathzer.soft.javaluator.DoubleEvaluator;
++import com.fathzer.soft.javaluator.StaticVariableSet;
++
++public abstract class PriceCalculator {
++
++	private final String expression;
++	private final DoubleEvaluator evaluator = new DoubleEvaluator();
++
++	public PriceCalculator(String expression) {
++		this.expression = expression;
++	}
++
++	protected final double evaluate(StaticVariableSet<Double> vars) {
++		return this.evaluator.evaluate(this.expression, vars);
++	}
++}
+diff --git a/io.openems.edge.timeofusetariff.entsoe/src/io/openems/edge/timeofusetariff/entsoe/PriceCalculatorXY.java b/io.openems.edge.timeofusetariff.entsoe/src/io/openems/edge/timeofusetariff/entsoe/PriceCalculatorXY.java
+new file mode 100644
+index 0000000..227cae7
+--- /dev/null
++++ b/io.openems.edge.timeofusetariff.entsoe/src/io/openems/edge/timeofusetariff/entsoe/PriceCalculatorXY.java
+@@ -0,0 +1,55 @@
++package io.openems.edge.timeofusetariff.entsoe;
++
++import org.slf4j.Logger;
++import org.slf4j.LoggerFactory;
++
++import com.fathzer.soft.javaluator.StaticVariableSet;
++import com.google.common.annotations.VisibleForTesting;
++
++/**
++ * A {@link PriceCalculator} with variables 'X' and 'Y'.
++ */
++public class PriceCalculatorXY extends PriceCalculator {
++
++	private static final Logger LOG = LoggerFactory.getLogger(PriceCalculatorXY.class);
++	private static final String DEFAULT_EXPRESSION = "x + y";
++
++	/**
++	 * Builds a {@link PriceCalculatorXY} from a String expression. Validates the
++	 * expression; if it fails, falls back to default.
++	 * 
++	 * @param expression the expression
++	 * @return the {@link PriceCalculatorXY}
++	 */
++	public static PriceCalculatorXY fromExpression(String expression) {
++		try {
++			final var priceCalculator = new PriceCalculatorXY(expression);
++			priceCalculator.calculate(1., 1.);
++			return priceCalculator;
++		} catch (Exception e) {
++			LOG.warn("Calculate expression [" + expression + "] failed. Falling back to [" + DEFAULT_EXPRESSION + "].");
++			return new PriceCalculatorXY(DEFAULT_EXPRESSION);
++		}
++
++	}
++
++	final StaticVariableSet<Double> vars = new StaticVariableSet<>();
++
++	@VisibleForTesting
++	PriceCalculatorXY(String expression) {
++		super(expression);
++	}
++
++	/**
++	 * Executes the price calculation.
++	 * 
++	 * @param x the variable 'x'
++	 * @param y the variable 'y'
++	 * @return the result
++	 */
++	public synchronized double calculate(double x, double y) {
++		this.vars.set("x", x);
++		this.vars.set("y", y);
++		return this.evaluate(this.vars);
++	}
++}
+diff --git a/io.openems.edge.timeofusetariff.entsoe/src/io/openems/edge/timeofusetariff/entsoe/TouEntsoeImpl.java b/io.openems.edge.timeofusetariff.entsoe/src/io/openems/edge/timeofusetariff/entsoe/TouEntsoeImpl.java
+index f34be4a..b0e7c4b 100644
+--- a/io.openems.edge.timeofusetariff.entsoe/src/io/openems/edge/timeofusetariff/entsoe/TouEntsoeImpl.java
++++ b/io.openems.edge.timeofusetariff.entsoe/src/io/openems/edge/timeofusetariff/entsoe/TouEntsoeImpl.java
+@@ -58,6 +58,7 @@ public class TouEntsoeImpl extends AbstractOpenemsComponent implements TouEntsoe
+ 	private ComponentManager componentManager;
+ 
+ 	private TouManualHelper helper = TouManualHelper.EMPTY_TOU_MANUAL_HELPER;
++	private volatile PriceCalculatorXY priceCalculator = PriceCalculatorXY.fromExpression("x + y");
+ 	private EntsoeMarketPriceProvider priceProvider;
+ 
+ 	private final Consumer<MarketPriceUpdateEvent> onUpdateEvent = this::onUpdateEvent;
+@@ -95,6 +96,7 @@ public class TouEntsoeImpl extends AbstractOpenemsComponent implements TouEntsoe
+ 		}
+ 
+ 		this.applySchedule(config);
++		this.priceCalculator = PriceCalculatorXY.fromExpression(config.calculateExpression());
+ 
+ 		this.priceProvider = this.entsoeMarketPriceProviderPool
+ 				.get(new EntsoeConfiguration(config.biddingZone(), config.securityToken()));
+@@ -165,7 +167,8 @@ public class TouEntsoeImpl extends AbstractOpenemsComponent implements TouEntsoe
+ 		final double exchangeRate = getExchangeRateOrElse(marketPriceData.getCurrency(), globalCurrency, 1.);
+ 		final var gridFees = this.helper.getPrices();
+ 
+-		final var processedPrices = Utils.processPrices(this.componentManager.getClock(), marketPriceData.getValues(),
++		final var processedPrices = Utils.processPrices(this.componentManager.getClock(), this.priceCalculator,
++				marketPriceData.getValues(),
+ 				exchangeRate, gridFees);
+ 		this.prices.set(processedPrices);
+ 	}
+diff --git a/io.openems.edge.timeofusetariff.entsoe/src/io/openems/edge/timeofusetariff/entsoe/Utils.java b/io.openems.edge.timeofusetariff.entsoe/src/io/openems/edge/timeofusetariff/entsoe/Utils.java
+index 9c45588..5e6ea19 100644
+--- a/io.openems.edge.timeofusetariff.entsoe/src/io/openems/edge/timeofusetariff/entsoe/Utils.java
++++ b/io.openems.edge.timeofusetariff.entsoe/src/io/openems/edge/timeofusetariff/entsoe/Utils.java
+@@ -15,7 +15,8 @@ import io.openems.edge.timeofusetariff.api.TimeOfUsePrices;
+ 
+ public class Utils {
+ 
+-	protected static TimeRangeValues<Double> processPrices(Clock clock, TimeRangeValues<Double> marketPrices,
++	protected static TimeRangeValues<Double> processPrices(Clock clock, PriceCalculatorXY priceCalculator,
++			TimeRangeValues<Double> marketPrices,
+ 			double exchangeRate, TimeOfUsePrices gridFees) {
+ 
+ 		var timeSpan = marketPrices.getTimeSpan().getOverlappingTime(gridFees.getTimeSpan())
+@@ -33,7 +34,7 @@ public class Utils {
+ 
+ 			// converting grid fees from ct/KWh -> EUR/MWh
+ 			var gridFeesPerMwh = gridFee * 10;
+-			var priceWithFee = (marketPrice + gridFeesPerMwh) * exchangeRate;
++			var priceWithFee = priceCalculator.calculate(marketPrice, gridFeesPerMwh) * exchangeRate;
+ 
+ 			resultBuilder.setByTime(time, priceWithFee);
+ 			time = time.plus(DurationUnit.ofMinutes(15).getDuration());
+diff --git a/io.openems.edge.timeofusetariff.entsoe/test/io/openems/edge/timeofusetariff/entsoe/MyConfig.java b/io.openems.edge.timeofusetariff.entsoe/test/io/openems/edge/timeofusetariff/entsoe/MyConfig.java
+index df0533e..db69fac 100644
+--- a/io.openems.edge.timeofusetariff.entsoe/test/io/openems/edge/timeofusetariff/entsoe/MyConfig.java
++++ b/io.openems.edge.timeofusetariff.entsoe/test/io/openems/edge/timeofusetariff/entsoe/MyConfig.java
+@@ -11,6 +11,7 @@ public class MyConfig extends AbstractComponentConfig implements Config {
+ 		private String securityToken;
+ 		private EntsoeBiddingZone biddingZone;
+ 		private String ancillaryCosts;
++		private String calculateExpression;
+ 
+ 		private Builder() {
+ 		}
+@@ -35,6 +36,11 @@ public class MyConfig extends AbstractComponentConfig implements Config {
+ 			return this;
+ 		}
+ 
++		public Builder setCalculateExpression(String calculateExpression) {
++			this.calculateExpression = calculateExpression;
++			return this;
++		}
++
+ 		public MyConfig build() {
+ 			return new MyConfig(this);
+ 		}
+@@ -71,4 +77,10 @@ public class MyConfig extends AbstractComponentConfig implements Config {
+ 		return this.builder.ancillaryCosts;
+ 	}
+ 
+-}
+\ No newline at end of file
++
++	@Override
++	public String calculateExpression() {
++		return this.builder.calculateExpression;
++	}
++
++}
+diff --git a/io.openems.wrapper/bnd.bnd b/io.openems.wrapper/bnd.bnd
+index 7b169a5..5107b1b 100644
+--- a/io.openems.wrapper/bnd.bnd
++++ b/io.openems.wrapper/bnd.bnd
+@@ -26,6 +26,7 @@ Bundle-Description: This wraps external java libraries that do not have OSGi hea
+ 	io.helins:linux-errno;version='1.0.2',\
+ 	io.helins:linux-i2c;version='1.0.2',\
+ 	io.helins:linux-io;version='0.0.4',\
++	com.fathzer:javaluator;version='3.0.6',\
+ 	io.jenetics:jenetics;version='8.3.0',\
+ 	io.reactivex.rxjava3.rxjava;version='3.1.8',\
+ 	org.dhatim:fastexcel-reader;version='0.20.0',\
+diff --git a/io.openems.wrapper/javaluator.bnd b/io.openems.wrapper/javaluator.bnd
+new file mode 100644
+index 0000000..30e57c2
+--- /dev/null
++++ b/io.openems.wrapper/javaluator.bnd
+@@ -0,0 +1,17 @@
++Bundle-Name: javaluator
++Bundle-Description: Javaluator is a simple, but powerful, infix expression evaluator for Java. 
++Bundle-DocURL: https://github.com/fathzer/javaluator
++Bundle-License: https://opensource.org/licenses/Apache-2.0
++Bundle-Version: 3.0.6
++
++Include-Resource: \
++	@javaluator-3.0.6.jar,\
++
++-dsannotations: *
++
++-metatypeannotations: *
++
++Export-Package: \
++    com.fathzer.soft.javaluator,\
++
++-sources: false

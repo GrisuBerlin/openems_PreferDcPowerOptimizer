@@ -1,0 +1,37 @@
+diff --git a/io.openems.edge.solaredge/src/io/openems/edge/solaredge/charger/SolaredgeDcChargerImpl.java b/io.openems.edge.solaredge/src/io/openems/edge/solaredge/charger/SolaredgeDcChargerImpl.java
+index 247f3df..969463b 100644
+--- a/io.openems.edge.solaredge/src/io/openems/edge/solaredge/charger/SolaredgeDcChargerImpl.java
++++ b/io.openems.edge.solaredge/src/io/openems/edge/solaredge/charger/SolaredgeDcChargerImpl.java
+@@ -124,13 +124,13 @@ public class SolaredgeDcChargerImpl extends AbstractSunSpecDcCharger implements
+ 	void activate(ComponentContext context, Config config) throws OpenemsException {
+ 	    this.config = config;
+ 
+-	    if (OpenemsComponent.updateReferenceFilter(this.cm, this.servicePid(), "ess", config.ess_id())) {
+-	        return;
+-	    }
+ 	    if (super.activate(context, config.id(), config.alias(), config.enabled(), this.ess.getUnitId(), this.cm,
+ 	            "Modbus", this.ess.getModbusBridgeId(), READ_FROM_MODBUS_BLOCK)) {
+ 	        return;
+ 	    }
++	    if (OpenemsComponent.updateReferenceFilter(this.cm, this.servicePid(), "ess", config.ess_id())) {
++	        return;
++	    }
+ 
+ 	    this.ess.addCharger(this);
+ 
+diff --git a/io.openems.edge.solaredge/src/io/openems/edge/solaredge/pvinverter/SolarEdgePvInverterImpl.java b/io.openems.edge.solaredge/src/io/openems/edge/solaredge/pvinverter/SolarEdgePvInverterImpl.java
+index 0cf21b1..cac62fc 100644
+--- a/io.openems.edge.solaredge/src/io/openems/edge/solaredge/pvinverter/SolarEdgePvInverterImpl.java
++++ b/io.openems.edge.solaredge/src/io/openems/edge/solaredge/pvinverter/SolarEdgePvInverterImpl.java
+@@ -100,8 +100,9 @@ public class SolarEdgePvInverterImpl extends AbstractSunSpecPvInverter
+ 
+ 	@Activate
+ 	private void activate(ComponentContext context, Config config) throws OpenemsException {
+-	    if (super.activate(context, config.id(), config.alias(), config.enabled(), config.modbusUnitId(), this.cm,
+-				"Modbus", config.modbus_id(), READ_FROM_MODBUS_BLOCK)) {
++	    if (super.activate(context, config.id(), config.alias(), config.enabled(), config.readOnly(),
++	            config.modbusUnitId(), this.cm, "Modbus", config.modbus_id(), READ_FROM_MODBUS_BLOCK,
++	            config.phase())) {
+ 			return;
+ 		}
+ 	}

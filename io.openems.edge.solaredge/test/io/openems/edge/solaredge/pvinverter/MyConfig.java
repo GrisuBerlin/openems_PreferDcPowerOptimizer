@@ -10,6 +10,7 @@ public class MyConfig extends AbstractComponentConfig implements Config {
 	protected static class Builder {
 		private String id;
 		private boolean readOnly;
+		private boolean hybrid;
 		private String modbusId;
 		private int modbusUnitId;
 		private SingleOrAllPhase phase;
@@ -19,6 +20,11 @@ public class MyConfig extends AbstractComponentConfig implements Config {
 
 		public Builder setId(String id) {
 			this.id = id;
+			return this;
+		}
+
+		public Builder setHybrid(boolean hybrid) {
+			this.hybrid = hybrid;
 			return this;
 		}
 
@@ -64,11 +70,6 @@ public class MyConfig extends AbstractComponentConfig implements Config {
 	}
 
 	@Override
-	public boolean readOnly() {
-		return this.builder.readOnly;
-	}
-
-	@Override
 	public String modbus_id() {
 		return this.builder.modbusId;
 	}
@@ -86,6 +87,12 @@ public class MyConfig extends AbstractComponentConfig implements Config {
 	@Override
 	public SingleOrAllPhase phase() {
 		return this.builder.phase;
+	}
+
+	@Override
+	public boolean readOnly() {
+		return this.builder.readOnly;
+
 	}
 
 }

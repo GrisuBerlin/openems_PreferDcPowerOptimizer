@@ -36,6 +36,7 @@ import io.openems.edge.common.taskmanager.Priority;
 import io.openems.edge.meter.api.ElectricityMeter;
 import io.openems.edge.pvinverter.api.ManagedSymmetricPvInverter;
 
+
 @Designate(ocd = Config.class, factory = true)
 @Component(//
 		name = "SolarEdge.PV-Inverter", //
@@ -58,25 +59,29 @@ public class SolarEdgePvInverterImpl extends AbstractSunSpecPvInverter
 			.put(DefaultSunSpecModel.S_101, Priority.LOW) //
 			.put(DefaultSunSpecModel.S_102, Priority.LOW) //
 			.put(DefaultSunSpecModel.S_103, Priority.LOW) //
-			.put(DefaultSunSpecModel.S_111, Priority.LOW) //
-			.put(DefaultSunSpecModel.S_112, Priority.LOW) //
-			.put(DefaultSunSpecModel.S_113, Priority.LOW) //
-			.put(DefaultSunSpecModel.S_120, Priority.LOW) //
-			.put(DefaultSunSpecModel.S_121, Priority.LOW) //
-			.put(DefaultSunSpecModel.S_122, Priority.LOW) //
-			.put(DefaultSunSpecModel.S_123, Priority.LOW) //
-			.put(DefaultSunSpecModel.S_124, Priority.LOW) //
-			.put(DefaultSunSpecModel.S_125, Priority.LOW) //
-			.put(DefaultSunSpecModel.S_127, Priority.LOW) //
-			.put(DefaultSunSpecModel.S_128, Priority.LOW) //
-			.put(DefaultSunSpecModel.S_145, Priority.LOW) //
+			//.put(DefaultSunSpecModel.S_111, Priority.LOW) //
+			//.put(DefaultSunSpecModel.S_112, Priority.LOW) //
+			//.put(DefaultSunSpecModel.S_113, Priority.LOW) //
+			//.put(DefaultSunSpecModel.S_120, Priority.LOW) //
+			//.put(DefaultSunSpecModel.S_121, Priority.LOW) //
+			//.put(DefaultSunSpecModel.S_122, Priority.LOW) //
+			//.put(DefaultSunSpecModel.S_123, Priority.LOW) //
+			//.put(DefaultSunSpecModel.S_124, Priority.LOW) //
+			//.put(DefaultSunSpecModel.S_125, Priority.LOW) //
+			//.put(DefaultSunSpecModel.S_127, Priority.LOW) //
+			//.put(DefaultSunSpecModel.S_128, Priority.LOW) //
+			//.put(DefaultSunSpecModel.S_145, Priority.LOW) //
 			.build();
+
 
 	@Reference
 	private ConfigurationAdmin cm;
 
 	@Override
-	@Reference(policy = ReferencePolicy.STATIC, policyOption = ReferencePolicyOption.GREEDY, cardinality = ReferenceCardinality.MANDATORY)
+	@Reference(//
+			policy = ReferencePolicy.STATIC, //
+			policyOption = ReferencePolicyOption.GREEDY, //
+			cardinality = ReferenceCardinality.MANDATORY)
 	protected void setModbus(BridgeModbus modbus) {
 		super.setModbus(modbus);
 	}
@@ -95,8 +100,9 @@ public class SolarEdgePvInverterImpl extends AbstractSunSpecPvInverter
 
 	@Activate
 	private void activate(ComponentContext context, Config config) throws OpenemsException {
-		if (super.activate(context, config.id(), config.alias(), config.enabled(), config.readOnly(),
-				config.modbusUnitId(), this.cm, "Modbus", config.modbus_id(), READ_FROM_MODBUS_BLOCK, config.phase())) {
+	    if (super.activate(context, config.id(), config.alias(), config.enabled(), config.readOnly(),
+	            config.modbusUnitId(), this.cm, "Modbus", config.modbus_id(), READ_FROM_MODBUS_BLOCK,
+	            config.phase())) {
 			return;
 		}
 	}

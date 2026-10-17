@@ -75,6 +75,7 @@
 	bnd.identity;id='io.openems.edge.controller.ess.acisland',\
 	bnd.identity;id='io.openems.edge.controller.ess.activepowervoltagecharacteristic',\
 	bnd.identity;id='io.openems.edge.controller.ess.balancing',\
+	bnd.identity;id='io.openems.edge.controller.ess.chargedischargelimiter',\
 	bnd.identity;id='io.openems.edge.controller.ess.cycle',\
 	bnd.identity;id='io.openems.edge.controller.ess.delaycharge',\
 	bnd.identity;id='io.openems.edge.controller.ess.delayedselltogrid',\
@@ -184,6 +185,7 @@
 	bnd.identity;id='io.openems.edge.meter.ziehl',\
 	bnd.identity;id='io.openems.edge.onewire.thermometer',\
 	bnd.identity;id='io.openems.edge.predictor.lstm',\
+	bnd.identity;id='io.openems.edge.predictor.pv.weather.forecast',\
 	bnd.identity;id='io.openems.edge.predictor.persistencemodel',\
 	bnd.identity;id='io.openems.edge.predictor.production.linearmodel',\
 	bnd.identity;id='io.openems.edge.predictor.profileclusteringmodel',\
@@ -443,6 +445,7 @@
 	io.openems.wrapper.influxdb-flux-dsl;version=snapshot,\
 	io.openems.wrapper.io.reactivex.rxjava3.rxjava;version=snapshot,\
 	io.openems.wrapper.javax.activation;version=snapshot,\
+	io.openems.wrapper.javaluator;version=snapshot,\
 	io.openems.wrapper.jenetics;version=snapshot,\
 	io.openems.wrapper.kotlinx-coroutines-core-jvm;version=snapshot,\
 	io.openems.wrapper.olcut;version=snapshot,\
@@ -492,4 +495,6 @@
 	org.owasp.encoder;version='[1.4.0,1.4.1)',\
 	reactive-streams;version='[1.0.4,1.0.5)',\
 	rrd4j;version='[3.10.0,3.10.1)',\
-	stax2-api;version='[4.2.2,4.2.3)'
+	stax2-api;version='[4.2.2,4.2.3)',\
+	io.openems.edge.controller.ess.chargedischargelimiter;version=snapshot,\
+	io.openems.edge.predictor.pv.weather.forecast;version=snapshot

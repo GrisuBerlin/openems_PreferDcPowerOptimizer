@@ -15,7 +15,8 @@ import io.openems.edge.timeofusetariff.api.TimeOfUsePrices;
 
 public class Utils {
 
-	protected static TimeRangeValues<Double> processPrices(Clock clock, TimeRangeValues<Double> marketPrices,
+	protected static TimeRangeValues<Double> processPrices(Clock clock, PriceCalculatorXY priceCalculator,
+			TimeRangeValues<Double> marketPrices,
 			double exchangeRate, TimeOfUsePrices gridFees) {
 
 		var timeSpan = marketPrices.getTimeSpan().getOverlappingTime(gridFees.getTimeSpan())
@@ -33,7 +34,7 @@ public class Utils {
 
 			// converting grid fees from ct/KWh -> EUR/MWh
 			var gridFeesPerMwh = gridFee * 10;
-			var priceWithFee = (marketPrice + gridFeesPerMwh) * exchangeRate;
+			var priceWithFee = priceCalculator.calculate(marketPrice, gridFeesPerMwh) * exchangeRate;
 
 			resultBuilder.setByTime(time, priceWithFee);
 			time = time.plus(DurationUnit.ofMinutes(15).getDuration());

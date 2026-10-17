@@ -18,6 +18,7 @@ import io.openems.common.types.MeterType;
 	@AttributeDefinition(name = "Is enabled?", description = "Is this Component enabled?")
 	boolean enabled() default true;
 
+	
 	@AttributeDefinition(name = "Meter-Type", description = "What is measured by this Meter?")
 	MeterType type() default MeterType.GRID;
 
@@ -36,3 +37,4 @@ import io.openems.common.types.MeterType;
 	String webconsole_configurationFactory_nameHint() default "Meter SolarEdge [{id}]";
 
 }
+
